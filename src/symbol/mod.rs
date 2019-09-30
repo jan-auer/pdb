@@ -188,6 +188,10 @@ pub enum SymbolData<'t> {
     Label(LabelSymbol<'t>),
     /// A block
     Block(BlockSymbol<'t>),
+    /// Data allocated relative to a register
+    RegisterRelative(RegisterRelativeSymbol<'t>),
+    /// A thunk
+    Thunk(ThunkSymbol<'t>),
 }
 
 impl<'t> SymbolData<'t> {
@@ -217,6 +221,8 @@ impl<'t> SymbolData<'t> {
             SymbolData::ProcedureEnd => None,
             SymbolData::Label(data) => Some(data.name),
             SymbolData::Block(data) => Some(data.name),
+            SymbolData::RegisterRelative(data) => Some(data.name),
+            SymbolData::Thunk(data) => Some(data.name),
         }
     }
 }
@@ -267,6 +273,8 @@ impl<'t> TryFromCtx<'t> for SymbolData<'t> {
             S_PROC_ID_END => SymbolData::ProcedureEnd,
             S_LABEL32 | S_LABEL32_ST => SymbolData::Label(buf.parse_with(kind)?),
             S_BLOCK32 | S_BLOCK32_ST => SymbolData::Block(buf.parse_with(kind)?),
+            S_REGREL32 => SymbolData::RegisterRelative(buf.parse_with(kind)?),
+            S_THUNK32 | S_THUNK32_ST => SymbolData::Thunk(buf.parse_with(kind)?),
             other => return Err(Error::UnimplementedSymbolKind(other)),
         };
 
@@ -1250,6 +1258,127 @@ impl<'t> TryFromCtx<'t, SymbolKind> for BlockSymbol<'t> {
     }
 }
 
+/// A register relative symbol.
+///
+/// The address of the variable is the value in the register + offset (e.g. %EBP + 8).
+///
+/// Symbol kind `S_REGREL32`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RegisterRelativeSymbol<'t> {
+    /// The variable offset.
+    pub offset: i32,
+    /// The type of the variable.
+    pub type_index: TypeIndex,
+    /// The register this variable address is relative to.
+    pub register: Register,
+    /// The variable name.
+    pub name: RawString<'t>,
+}
+
+impl<'t> TryFromCtx<'t, SymbolKind> for RegisterRelativeSymbol<'t> {
+    type Error = Error;
+    type Size = usize;
+
+    fn try_from_ctx(this: &'t [u8], kind: SymbolKind) -> Result<(Self, Self::Size)> {
+        let mut buf = ParseBuffer::from(this);
+
+        let symbol = RegisterRelativeSymbol {
+            offset: buf.parse()?,
+            type_index: buf.parse()?,
+            register: buf.parse()?,
+            name: parse_symbol_name(&mut buf, kind)?,
+        };
+
+        Ok((symbol, buf.pos()))
+    }
+}
+
+/// Thunk adjustor
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ThunkAdjustor<'t> {
+    delta: u16,
+    target: RawString<'t>,
+}
+
+/// A thunk kind
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ThunkKind<'t> {
+    /// Standard thunk
+    NoType,
+    /// "this" adjustor thunk with delta and target
+    Adjustor(ThunkAdjustor<'t>),
+    /// Virtual call thunk with table entry
+    VCall(u16),
+    /// pcode thunk
+    PCode,
+    /// thunk which loads the address to jump to via unknown means...
+    Load,
+    /// Unknown with ordinal value
+    Unknown(u8),
+}
+
+/// A thunk symbol.
+///
+/// Symbol kind `S_THUNK32`, or `S_THUNK32_ST`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ThunkSymbol<'t> {
+    /// The parent scope that this thunk is nested in.
+    pub parent: Option<SymbolIndex>,
+    /// The end symbol of this thunk.
+    pub end: SymbolIndex,
+    /// The next symbol.
+    pub next: Option<SymbolIndex>,
+    /// Code offset of the start of this label.
+    pub offset: PdbInternalSectionOffset,
+    /// The length of the thunk.
+    pub len: u16,
+    /// The kind of the thunk.
+    pub kind: ThunkKind<'t>,
+    /// The thunk name.
+    pub name: RawString<'t>,
+}
+
+impl<'t> TryFromCtx<'t, SymbolKind> for ThunkSymbol<'t> {
+    type Error = Error;
+    type Size = usize;
+
+    fn try_from_ctx(this: &'t [u8], kind: SymbolKind) -> Result<(Self, Self::Size)> {
+        let mut buf = ParseBuffer::from(this);
+
+        let parent = parse_optional_index(&mut buf)?;
+        let end = buf.parse()?;
+        let next = parse_optional_index(&mut buf)?;
+        let offset = buf.parse()?;
+        let len = buf.parse()?;
+        let ord = buf.parse::<u8>()?;
+        let name = parse_symbol_name(&mut buf, kind)?;
+
+        let kind = match ord {
+            0 => ThunkKind::NoType,
+            1 => ThunkKind::Adjustor(ThunkAdjustor {
+                delta: buf.parse::<u16>()?,
+                target: buf.parse_cstring()?,
+            }),
+            2 => ThunkKind::VCall(buf.parse::<u16>()?),
+            3 => ThunkKind::PCode,
+            4 => ThunkKind::Load,
+            ord => ThunkKind::Unknown(ord),
+        };
+
+        let symbol = ThunkSymbol {
+            parent,
+            end,
+            next,
+            offset,
+            len,
+            kind,
+            name,
+        };
+
+        Ok((symbol, buf.pos()))
+    }
+}
+
 /// PDB symbol tables contain names, locations, and metadata about functions, global/static data,
 /// constants, data types, and more.
 ///
@@ -1411,6 +1540,37 @@ mod tests {
         }
 
         #[test]
+        fn kind_1102() {
+            let data = &[
+                2, 17, 0, 0, 0, 0, 108, 22, 0, 0, 0, 0, 0, 0, 140, 11, 0, 0, 1, 0, 9, 0, 3, 91,
+                116, 104, 117, 110, 107, 93, 58, 68, 101, 114, 105, 118, 101, 100, 58, 58, 70, 117,
+                110, 99, 49, 96, 97, 100, 106, 117, 115, 116, 111, 114, 123, 56, 125, 39, 0, 0, 0,
+                0,
+            ];
+
+            let symbol = Symbol {
+                data,
+                index: SymbolIndex(0),
+            };
+            assert_eq!(symbol.raw_kind(), 0x1102);
+            assert_eq!(
+                symbol.parse().expect("parse"),
+                SymbolData::Thunk(ThunkSymbol {
+                    parent: None,
+                    end: SymbolIndex(0x166c),
+                    next: None,
+                    offset: PdbInternalSectionOffset {
+                        section: 0x1,
+                        offset: 0xb8c
+                    },
+                    len: 9,
+                    kind: ThunkKind::PCode,
+                    name: "[thunk]:Derived::Func1`adjustor{8}'".into()
+                })
+            );
+        }
+
+        #[test]
         fn kind_1105() {
             let data = &[
                 5, 17, 224, 95, 151, 0, 1, 0, 0, 100, 97, 118, 49, 100, 95, 119, 95, 97, 118, 103,
@@ -1488,6 +1648,29 @@ mod tests {
                         section: 1
                     },
                     name: "__local_stdio_printf_options".into(),
+                })
+            );
+        }
+
+        #[test]
+        fn kind_1111() {
+            let data = &[
+                17, 17, 12, 0, 0, 0, 48, 16, 0, 0, 22, 0, 109, 97, 120, 105, 109, 117, 109, 95, 99,
+                111, 117, 110, 116, 0,
+            ];
+
+            let symbol = Symbol {
+                data,
+                index: SymbolIndex(0),
+            };
+            assert_eq!(symbol.raw_kind(), 0x1111);
+            assert_eq!(
+                symbol.parse().expect("parse"),
+                SymbolData::RegisterRelative(RegisterRelativeSymbol {
+                    offset: 12,
+                    type_index: TypeIndex(0x1030),
+                    register: Register(22),
+                    name: "maximum_count".into(),
                 })
             );
         }
