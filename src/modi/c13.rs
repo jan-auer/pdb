@@ -1,3 +1,5 @@
+use std::fmt;
+
 use scroll::{ctx::TryFromCtx, Pread};
 
 use crate::common::*;
@@ -210,6 +212,7 @@ impl DebugLinesHeader {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
 struct DebugLinesSubsection<'a> {
     header: DebugLinesHeader,
     data: &'a [u8],
@@ -583,16 +586,18 @@ impl<'a> DebugFileChecksumsSubsection<'a> {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone)]
 pub struct C13LineIterator<'a> {
     /// Iterator over all subsections in the current module.
-    sections: DebugSubsectionIterator<'a>,
+    sections: std::slice::Iter<'a, DebugLinesSubsection<'a>>,
     /// Iterator over all blocks in the current lines subsection.
     blocks: DebugLinesBlockIterator<'a>,
     /// Iterator over lines in the current block.
     lines: DebugLinesIterator<'a>,
     /// Iterator over optional columns in the current block.
     columns: DebugColumnsIterator<'a>,
+    /// Previous line info before length can be inferred.
+    last_info: Option<LineInfo>,
 }
 
 impl<'a> FallibleIterator for C13LineIterator<'a> {
@@ -619,16 +624,26 @@ impl<'a> FallibleIterator for C13LineIterator<'a> {
                 let section_header = self.blocks.header;
                 let block_header = self.lines.block;
 
-                return Ok(Some(LineInfo {
-                    offset: section_header.offset + line_entry.offset,
-                    length: None, // TODO(ja): Infer length from the next entry or the parent..?
+                let offset = section_header.offset + line_entry.offset;
+
+                let line_info = LineInfo {
+                    offset,
+                    length: None, // Length is inferred in the next iteration.
                     file_index: FileIndex(block_header.file_index),
                     line_start: line_entry.start_line,
                     line_end: line_entry.end_line,
                     column_start: column_entry.map(|e| e.start_column.into()),
                     column_end: column_entry.map(|e| e.end_column.into()),
                     kind: line_entry.kind,
-                }));
+                };
+
+                let mut last_info = match std::mem::replace(&mut self.last_info, Some(line_info)) {
+                    Some(last_info) => last_info,
+                    None => continue,
+                };
+
+                last_info.set_end(offset);
+                return Ok(Some(last_info));
             }
 
             if let Some(block) = self.blocks.next()? {
@@ -637,19 +652,49 @@ impl<'a> FallibleIterator for C13LineIterator<'a> {
                 continue;
             }
 
-            if let Some(section) = self.sections.next()? {
-                if section.kind == DebugSubsectionKind::Lines {
-                    let lines_section = DebugLinesSubsection::parse(section.data)?;
-                    self.blocks = lines_section.blocks();
-                }
+            // The current debug lines subsection ends. Fix up the length of the last line record
+            // using the code size of the lines section, before continuing iteration. This ensures
+            // the most accurate length of the line record, even if there are gaps between sections.
+            if let Some(ref mut last_line) = self.last_info {
+                let section_header = self.blocks.header;
+                last_line.set_end(section_header.offset + section_header.code_size);
+            }
+
+            if let Some(lines_section) = self.sections.next() {
+                self.blocks = lines_section.blocks();
                 continue;
             }
 
-            return Ok(None);
+            return Ok(self.last_info.take());
         }
     }
 }
 
+impl Default for C13LineIterator<'_> {
+    fn default() -> Self {
+        Self {
+            sections: [].iter(),
+            blocks: DebugLinesBlockIterator::default(),
+            lines: DebugLinesIterator::default(),
+            columns: DebugColumnsIterator::default(),
+            last_info: None,
+        }
+    }
+}
+
+impl fmt::Debug for C13LineIterator<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LineIterator")
+            .field("sections", &self.sections.as_slice())
+            .field("blocks", &self.blocks)
+            .field("lines", &self.lines)
+            .field("columns", &self.columns)
+            .field("last_info", &self.last_info)
+            .finish()
+    }
+}
+
+/// An iterator over line information records in a module.
 #[derive(Clone, Debug, Default)]
 pub struct C13InlineeLineIterator<'a> {
     annotations: BinaryAnnotationsIter<'a>,
@@ -864,53 +909,85 @@ impl<'a> FallibleIterator for C13FileIterator<'a> {
 }
 
 pub struct C13LineProgram<'a> {
-    data: &'a [u8],
     file_checksums: DebugFileChecksumsSubsection<'a>,
+    line_sections: Vec<DebugLinesSubsection<'a>>,
 }
 
 impl<'a> C13LineProgram<'a> {
     pub(crate) fn parse(data: &'a [u8]) -> Result<Self> {
-        let checksums_data = DebugSubsectionIterator::new(data)
-            .find(|sec| sec.kind == DebugSubsectionKind::FileChecksums)?
-            .map(|sec| sec.data);
+        let mut file_checksums = DebugFileChecksumsSubsection::default();
+        let mut line_sections = Vec::new();
 
-        let file_checksums = match checksums_data {
-            Some(d) => DebugFileChecksumsSubsection::parse(d)?,
-            None => DebugFileChecksumsSubsection::default(),
-        };
+        let mut sections_sorted = true;
+        let mut last_offset = None;
 
-        Ok(C13LineProgram {
-            data,
+        let mut section_iter = DebugSubsectionIterator::new(data);
+        while let Some(sec) = section_iter.next()? {
+            match sec.kind {
+                DebugSubsectionKind::FileChecksums => {
+                    file_checksums = DebugFileChecksumsSubsection::parse(sec.data)?;
+                }
+                DebugSubsectionKind::Lines => {
+                    let lines_section = DebugLinesSubsection::parse(sec.data)?;
+                    if let Some(last_offset) = last_offset {
+                        sections_sorted &= lines_section.header.offset < last_offset;
+                    }
+                    last_offset = Some(lines_section.header.offset);
+                    line_sections.push(lines_section);
+                }
+                _ => {}
+            }
+        }
+
+        if !sections_sorted {
+            line_sections.sort_unstable_by_key(Self::lines_key);
+        }
+
+        Ok(Self {
             file_checksums,
+            line_sections,
         })
     }
 
-    pub(crate) fn lines(&self) -> C13LineIterator<'a> {
+    pub(crate) fn lines(&self) -> C13LineIterator<'_> {
         C13LineIterator {
-            sections: DebugSubsectionIterator::new(self.data),
+            sections: self.line_sections.iter(),
             blocks: DebugLinesBlockIterator::default(),
             lines: DebugLinesIterator::default(),
             columns: DebugColumnsIterator::default(),
+            last_info: None,
         }
     }
 
-    pub(crate) fn lines_at_offset(&self, offset: PdbInternalSectionOffset) -> C13LineIterator<'a> {
-        // Since we only care about the start offset of an entire debug lines subsection, we can
-        // quickly advance to the first (and only) subsection that matches that offset. Since they
-        // are non-overlapping and not empty, we can bail out at the first match.
-        let section = DebugSubsectionIterator::new(self.data)
-            .filter(|section| section.kind == DebugSubsectionKind::Lines)
-            .and_then(|section| DebugLinesSubsection::parse(section.data))
-            .find(|lines_section| lines_section.header.offset == offset);
+    pub(crate) fn lines_for_symbol(&self, offset: PdbInternalSectionOffset) -> C13LineIterator<'_> {
+        // Search for the lines subsection that covers the given offset. They are non-overlapping
+        // and not empty, so there will be at most one match. In most cases, there will be an exact
+        // match for each symbol. However, ASM sometimes yields line records outside of the stated
+        // symbol range `[offset, offset+len)`. In this case, search for the section covering the
+        // offset.
+        let key = Self::lines_offset_key(offset);
+        let index_result = self
+            .line_sections
+            .binary_search_by_key(&key, Self::lines_key);
 
-        match section {
-            Ok(Some(section)) => C13LineIterator {
-                sections: DebugSubsectionIterator::default(),
-                blocks: section.blocks(),
-                lines: DebugLinesIterator::default(),
-                columns: DebugColumnsIterator::default(),
-            },
-            _ => Default::default(),
+        let section = match index_result {
+            Err(0) => return C13LineIterator::default(),
+            Err(i) => self.line_sections[i - 1],
+            Ok(i) => self.line_sections[i],
+        };
+
+        // In the `Err(i)` case, we might have chosen a lines subsection pointing into a different
+        // section. In this case, bail out.
+        if section.header.offset.section != offset.section {
+            return C13LineIterator::default();
+        }
+
+        C13LineIterator {
+            sections: [].iter(),
+            blocks: section.blocks(),
+            lines: DebugLinesIterator::default(),
+            columns: DebugColumnsIterator::default(),
+            last_info: None,
         }
     }
 
@@ -933,6 +1010,14 @@ impl<'a> C13LineProgram<'a> {
             checksum: entry.checksum,
         })
     }
+
+    fn lines_offset_key(offset: PdbInternalSectionOffset) -> (u16, u32) {
+        (offset.section, offset.offset)
+    }
+
+    fn lines_key(lines: &DebugLinesSubsection<'_>) -> (u16, u32) {
+        Self::lines_offset_key(lines.header.offset)
+    }
 }
 
 #[cfg(test)]
@@ -940,6 +1025,146 @@ mod tests {
     use super::*;
 
     use crate::symbol::BinaryAnnotations;
+
+    #[test]
+    fn test_iter_lines() {
+        let data = &[
+            244, 0, 0, 0, 24, 0, 0, 0, 169, 49, 0, 0, 16, 1, 115, 121, 2, 198, 45, 116, 88, 98,
+            157, 13, 221, 82, 225, 34, 192, 51, 0, 0, 242, 0, 0, 0, 48, 0, 0, 0, 132, 160, 0, 0, 1,
+            0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 36, 0, 0, 0, 0, 0, 0, 0, 22, 0, 0, 128,
+            0, 0, 0, 0, 23, 0, 0, 128, 11, 0, 0, 0, 24, 0, 0, 128,
+        ];
+
+        let line_program = C13LineProgram::parse(data).expect("parse line program");
+        let lines: Vec<_> = line_program.lines().collect().expect("collect lines");
+
+        let expected = [
+            LineInfo {
+                offset: PdbInternalSectionOffset {
+                    section: 0x1,
+                    offset: 0xa084,
+                },
+                length: Some(0),
+                file_index: FileIndex(0x0),
+                line_start: 22,
+                line_end: 22,
+                column_start: Some(0),
+                column_end: Some(0),
+                kind: LineInfoKind::Statement,
+            },
+            LineInfo {
+                offset: PdbInternalSectionOffset {
+                    section: 0x1,
+                    offset: 0xa084,
+                },
+                length: Some(11),
+                file_index: FileIndex(0x0),
+                line_start: 23,
+                line_end: 23,
+                column_start: Some(22),
+                column_end: Some(32768),
+                kind: LineInfoKind::Statement,
+            },
+            LineInfo {
+                offset: PdbInternalSectionOffset {
+                    section: 0x1,
+                    offset: 0xa08f,
+                },
+                length: Some(1),
+                file_index: FileIndex(0x0),
+                line_start: 24,
+                line_end: 24,
+                column_start: Some(0),
+                column_end: Some(0),
+                kind: LineInfoKind::Statement,
+            },
+        ];
+
+        assert_eq!(lines, expected);
+    }
+
+    #[test]
+    fn test_lines_for_symbol() {
+        let data = &[
+            244, 0, 0, 0, 24, 0, 0, 0, 169, 49, 0, 0, 16, 1, 115, 121, 2, 198, 45, 116, 88, 98,
+            157, 13, 221, 82, 225, 34, 192, 51, 0, 0, 242, 0, 0, 0, 48, 0, 0, 0, 132, 160, 0, 0, 1,
+            0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 36, 0, 0, 0, 0, 0, 0, 0, 22, 0, 0, 128,
+            0, 0, 0, 0, 23, 0, 0, 128, 11, 0, 0, 0, 24, 0, 0, 128,
+        ];
+
+        let offset = PdbInternalSectionOffset {
+            section: 0x0001,
+            offset: 0xa084,
+        };
+
+        let line_program = C13LineProgram::parse(data).expect("parse line program");
+        let line = line_program
+            .lines_for_symbol(offset)
+            .next()
+            .expect("get line");
+
+        let expected = Some(LineInfo {
+            offset: PdbInternalSectionOffset {
+                section: 0x1,
+                offset: 0xa084,
+            },
+            length: Some(0),
+            file_index: FileIndex(0x0),
+            line_start: 22,
+            line_end: 22,
+            column_start: Some(0),
+            column_end: Some(0),
+            kind: LineInfoKind::Statement,
+        });
+
+        assert_eq!(expected, line);
+    }
+
+    #[test]
+    fn test_lines_for_symbol_asm() {
+        // This test is similar to lines_for_symbol, but it tests with an offset that points beyond
+        // the beginning of a lines subsection. This happens when dealing with MASM.
+
+        let data = &[
+            244, 0, 0, 0, 96, 0, 0, 0, 177, 44, 0, 0, 16, 1, 148, 43, 19, 100, 121, 95, 165, 113,
+            45, 169, 112, 53, 233, 149, 174, 133, 0, 0, 248, 44, 0, 0, 16, 1, 54, 176, 28, 14, 163,
+            149, 3, 189, 0, 215, 91, 24, 204, 45, 117, 241, 0, 0, 59, 45, 0, 0, 16, 1, 191, 40,
+            129, 240, 15, 71, 114, 239, 184, 146, 206, 88, 119, 218, 136, 139, 0, 0, 126, 45, 0, 0,
+            16, 1, 175, 252, 248, 34, 196, 152, 31, 107, 144, 61, 83, 41, 122, 95, 140, 123, 0, 0,
+            242, 0, 0, 0, 96, 0, 0, 0, 112, 137, 0, 0, 1, 0, 0, 0, 49, 0, 0, 0, 0, 0, 0, 0, 9, 0,
+            0, 0, 84, 0, 0, 0, 16, 0, 0, 0, 45, 0, 0, 128, 16, 0, 0, 0, 47, 0, 0, 128, 23, 0, 0, 0,
+            48, 0, 0, 128, 26, 0, 0, 0, 49, 0, 0, 128, 30, 0, 0, 0, 50, 0, 0, 128, 35, 0, 0, 0, 51,
+            0, 0, 128, 38, 0, 0, 0, 52, 0, 0, 128, 40, 0, 0, 0, 62, 0, 0, 128, 44, 0, 0, 0, 66, 0,
+            0, 128,
+        ];
+
+        let offset = PdbInternalSectionOffset {
+            section: 0x0001,
+            offset: 0x8990, // XXX: section and first line record at 0x0980
+        };
+
+        let line_program = C13LineProgram::parse(data).expect("parse line program");
+        let line = line_program
+            .lines_for_symbol(offset)
+            .next()
+            .expect("get line");
+
+        let expected = Some(LineInfo {
+            offset: PdbInternalSectionOffset {
+                section: 0x1,
+                offset: 0x8980,
+            },
+            length: Some(0),
+            file_index: FileIndex(0x0),
+            line_start: 45,
+            line_end: 45,
+            column_start: Some(16),
+            column_end: Some(0),
+            kind: LineInfoKind::Statement,
+        });
+
+        assert_eq!(expected, line);
+    }
 
     #[test]
     fn test_parse_inlinee_lines() {

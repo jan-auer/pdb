@@ -169,6 +169,20 @@ pub struct LineInfo {
     pub kind: LineInfoKind,
 }
 
+impl LineInfo {
+    pub(crate) fn set_end(&mut self, end_offset: PdbInternalSectionOffset) {
+        debug_assert!(self.offset.section == end_offset.section);
+        if self.offset.section != end_offset.section {
+            return;
+        }
+
+        let length = end_offset.offset - self.offset.offset;
+        if self.length.map_or(true, |l| l > length) {
+            self.length = Some(length);
+        }
+    }
+}
+
 enum LineProgramInner<'a> {
     C13(c13::C13LineProgram<'a>),
 }
@@ -184,7 +198,7 @@ impl<'a> LineProgram<'a> {
     /// Note that line records are not guaranteed to be ordered by source code offset. If a
     /// monotonic order by `PdbInternalSectionOffset` or `Rva` is required, the lines have to be
     /// sorted manually.
-    pub fn lines(&self) -> LineIterator<'a> {
+    pub fn lines(&self) -> LineIterator<'_> {
         match self.inner {
             LineProgramInner::C13(ref inner) => LineIterator {
                 inner: LineIteratorInner::C13(inner.lines()),
@@ -201,19 +215,20 @@ impl<'a> LineProgram<'a> {
         }
     }
 
-    /// Returns an iterator over line records for the given section offset.
+    /// Returns an iterator over line records for a symbol at the given section offset.
     ///
-    /// This does not work with any arbitrary section offset. The iterator only returns lines if the
-    /// section offset is the start of a line block. This is true for procedure or symbol offsets
-    /// that specify line information. For all other offsets, the iterator will be empty.
+    /// This may return line records before the start offset of the symbol. When using ASM,
+    /// specifically MASM, symbol records may specify a range that is smaller than the actual
+    /// code generated for this function. `lines_for_symbol` returns all line records covering this
+    /// function, potentially exceeding this range.
     ///
     /// Note that line records are not guaranteed to be ordered by source code offset. If a
     /// monotonic order by `PdbInternalSectionOffset` or `Rva` is required, the lines have to be
     /// sorted manually.
-    pub fn lines_at_offset(&self, offset: PdbInternalSectionOffset) -> LineIterator {
+    pub fn lines_for_symbol(&self, offset: PdbInternalSectionOffset) -> LineIterator<'_> {
         match self.inner {
             LineProgramInner::C13(ref inner) => LineIterator {
-                inner: LineIteratorInner::C13(inner.lines_at_offset(offset)),
+                inner: LineIteratorInner::C13(inner.lines_for_symbol(offset)),
             },
         }
     }
